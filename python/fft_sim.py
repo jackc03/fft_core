@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 def numpy_fft(input_data):
+    assert len(input_data) == 512, f"expected 512-point input, got {len(input_data)}"
     return np.fft.fft(input_data)
 
 """
