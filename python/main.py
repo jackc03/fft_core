@@ -70,8 +70,31 @@ def visualize_image(path: str):
     plt.show()
 
 
+def _circular_image(path: str, size: int = 256):
+    """Load an image, center-crop to square, and mask it to a circle (alpha
+    zeroed outside the circle) so it drops cleanly into the polar hole."""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(path).convert("RGBA")
+    w, h = img.size
+    side = min(w, h)
+    left, top = (w - side) // 2, (h - side) // 2
+    img = img.crop((left, top, left + side, top + side)).resize((size, size))
+
+    arr = np.array(img).astype(np.float64) / 255.0
+    yy, xx = np.mgrid[0:size, 0:size]
+    c = (size - 1) / 2
+    r = np.sqrt((xx - c) ** 2 + (yy - c) ** 2)
+    arr[..., 3] *= r <= size / 2
+    return arr
+
+
+CENTER_IMAGE_DEFAULT = "inputs/4449d68b-e3a9-4799-805b-c3d3a8da2153.png"
+
+
 def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP,
-                  calibrate_s: float = 1.0):
+                  calibrate_s: float = 1.0, center_image: str | None = CENTER_IMAGE_DEFAULT):
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
@@ -109,6 +132,19 @@ def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP
                   bottom=r0, color="white")
     ax.set_ylim(0, r0 + 1)
     ax.axis("off")
+
+    if center_image:
+        # drop a small square axes into the figure sized/centered to exactly
+        # cover the polar plot's inner hole (radius r0 out of the full r0+1
+        # radial extent), then show the circle-masked image on it
+        face = _circular_image(center_image)
+        pos = ax.get_position()
+        cx, cy = (pos.x0 + pos.x1) / 2, (pos.y0 + pos.y1) / 2
+        box = min(pos.x1 - pos.x0, pos.y1 - pos.y0)
+        img_size = box * (r0 / (r0 + 1))
+        img_ax = fig.add_axes((cx - img_size / 2, cy - img_size / 2, img_size, img_size))
+        img_ax.imshow(face)
+        img_ax.axis("off")
 
     def update(_frame):
         levels = to_bars(next(stream))
