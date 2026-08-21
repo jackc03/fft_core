@@ -21,6 +21,7 @@ windowing + FFT stages -- left as a stub until those land there.
 """
 
 from __future__ import annotations
+import queue
 import shutil
 import subprocess
 import numpy as np
@@ -32,6 +33,12 @@ import fft_sim
 TARGET_FS = 48000   # Hz -- decode/resample rate fed to the ADC model
 ADC_BITS = 12        # XADC resolution
 W_DATA = 16          # datapath width after the ADC
+
+# shared by both spectrogram paths (mp3_to_numpy_spectrogram, mic_to_spectrogram)
+# so their frequency-bin resolution always matches -- mismatched n_fft/hop between
+# the two makes otherwise-identical audio group into visibly different bars
+SPEC_N_FFT = 512
+SPEC_HOP = 256
 
 
 # ---------------------------------------------------------------------------
@@ -136,17 +143,20 @@ def _dc_block(samples: list[int], w_data: int, shift: int = 10) -> list[int]:
 def mp3_to_fxp(path: str) -> np.ndarray:
     """Decode `path` and emulate the Arty S7 analog front end + ADC.
 
-    Returns a 1-D int64 array of signed W_DATA-bit samples at TARGET_FS,
-    the fixed-point stimulus fed to the FFT pipeline / RTL testbench.
+    Returns a 1-D int16 array in Q1.15 (1 sign bit, 15 fractional bits;
+    code -32768..32767 maps to value -1.0..0.99997) at TARGET_FS -- the
+    fixed-point stimulus fed to the FFT pipeline / RTL testbench.
     """
+    if W_DATA != 16:
+        raise ValueError("Q1.15 output requires W_DATA == 16")
     x = _decode_audio(path, TARGET_FS)
     codes = _adc_sample(x)
     samples = _codes_to_signed(codes, ADC_BITS, W_DATA)
     samples = _dc_block(samples, W_DATA)
-    return np.array(samples, dtype=np.int64)
+    return np.array(samples, dtype=np.int16)
 
 
-def mp3_to_numpy_spectrogram(path: str, n_fft: int = 2048, hop: int = 512):
+def mp3_to_numpy_spectrogram(path: str, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP):
     """Decode `path` and compute a magnitude (dB) spectrogram for visualization.
 
     Unlike mp3_to_fxp(), this stays in float and skips the ADC/fixed-point
@@ -163,12 +173,62 @@ def mp3_to_numpy_spectrogram(path: str, n_fft: int = 2048, hop: int = 512):
     window = np.hanning(n_fft)
     n_frames = max(1 + (len(audio) - n_fft) // hop, 0)
     spec = np.empty((n_fft // 2 + 1, n_frames), dtype=np.float64)
+    temp = np.empty((n_fft // 2 + 1, n_frames), dtype=np.int16)
     for i in range(n_frames):
         start = i * hop
         frame = audio[start:start + n_fft] * window
-        spec[:, i] = np.abs(fft_sim.numpy_fft(frame)[:n_fft // 2 + 1])
+        # np.fft.fft is unnormalized -- a full-scale tone peaks around n_fft/4
+        # after a Hann window, not 1.0 -- so divide by n_fft/2 to get magnitude
+        # back in roughly "fraction of full scale" terms before taking dB
+        spec[:, i] = np.abs(fft_sim.numpy_fft(frame)[:n_fft // 2 + 1]) / (n_fft / 2)
+        # Test arrary reordering
+        # if i == 25:
+        #     p = bitrev_table(512) # Compute permutation array for 512 samples
+        #     temp = fft_sim.custom_fft(frame)
+        #     print(temp)
     spec_db = 20 * np.log10(np.maximum(spec, 1e-6))
     return spec_db, audio, TARGET_FS, hop
 
 
+def mic_to_spectrogram(n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP, device: int | None = None):
+    """Open the default Windows microphone and yield live magnitude (dB)
+    spectrogram frames for real-time visualization.
 
+    Unlike mp3_to_numpy_spectrogram(), there's no file to decode up front --
+    this is a generator that blocks on live mic input and yields one frame
+    per hop of audio, forever. Each frame is computed from a rolling
+    n_fft-sample window (Hann-windowed, like the file-based path) so it
+    updates every hop but still has n_fft worth of frequency resolution.
+
+    Yields:
+      spec_db -- (n_fft//2 + 1,) magnitude in dB, low freq first
+
+    Stop by breaking out of the consuming loop or closing the generator
+    (e.g. `gen.close()`) -- that tears down the input stream cleanly.
+    """
+    import sounddevice as sd
+
+    window = np.hanning(n_fft)
+    buf = np.zeros(n_fft, dtype=np.float32)
+    q: queue.Queue[np.ndarray] = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        q.put(indata[:, 0].copy())
+
+    with sd.InputStream(samplerate=TARGET_FS, channels=1, blocksize=hop,
+                        dtype="float32", device=device, callback=callback):
+        while True:
+            block = q.get()
+            buf = np.concatenate((buf[len(block):], block))
+            # see mp3_to_numpy_spectrogram -- same n_fft/2 magnitude normalization
+            spec = np.abs(fft_sim.numpy_fft(buf * window)[:n_fft // 2 + 1]) / (n_fft / 2)
+            yield 20 * np.log10(np.maximum(spec, 1e-6))
+
+
+"""
+--------
+My Code
+--------
+"""
+def mp3_to_sim_spectrogram(path: str, n_fft: int = 2048, hop: int = 512):
+    pass

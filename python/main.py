@@ -1,4 +1,5 @@
-from audio_in import mp3_to_fxp, mp3_to_numpy_spectrogram, TARGET_FS
+from audio_in import (mp3_to_fxp, mp3_to_numpy_spectrogram, mic_to_spectrogram,
+                      TARGET_FS, SPEC_N_FFT, SPEC_HOP)
 
 
 def visualize_video(path: str, n_bars: int = 48):
@@ -69,18 +70,74 @@ def visualize_image(path: str):
     plt.show()
 
 
+def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP,
+                  calibrate_s: float = 1.0):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+
+    # same log-spaced bin grouping as visualize_video, just computed once
+    # up front since the mic's fs/n_fft are fixed rather than read from a file
+    freqs = np.linspace(0, TARGET_FS / 2, n_fft // 2 + 1)
+    edges = np.logspace(np.log10(max(freqs[1], 1.0)), np.log10(TARGET_FS / 2), n_bars + 1)
+    bin_idx = np.searchsorted(freqs, edges)
+
+    def to_bars(spec_db):
+        out = np.empty(n_bars)
+        for i in range(n_bars):
+            lo, hi = bin_idx[i], max(bin_idx[i + 1], bin_idx[i] + 1)
+            out[i] = spec_db[lo:hi].max()
+        return out
+
+    stream = mic_to_spectrogram(n_fft=n_fft, hop=hop)
+
+    # calibrate against THIS mic's actual idle noise, per bar, instead of
+    # guessing a universal dB reference -- Windows mic drivers often apply
+    # their own boost/AGC, so the real noise floor varies a lot by hardware
+    # and can't be predicted from a synthetic full-scale-tone calibration.
+    # Stay quiet for calibrate_s seconds when this starts.
+    n_calib = max(int(calibrate_s * TARGET_FS / hop), 1)
+    noise_floor = np.stack([to_bars(next(stream)) for _ in range(n_calib)]).max(axis=0)
+    AGC_SPAN_DB = 30.0  # dB above each bar's own noise floor mapped to full height
+
+    theta = np.linspace(0, 2 * np.pi, n_bars, endpoint=False)
+    r0 = 0.5  # inner radius -- bars spiral outward from this hole
+
+    fig = plt.figure(figsize=(8, 8), facecolor="black")
+    ax = fig.add_subplot(111, projection="polar", facecolor="black")
+    bars = ax.bar(theta, np.zeros(n_bars), width=2 * np.pi / n_bars * 0.9,
+                  bottom=r0, color="white")
+    ax.set_ylim(0, r0 + 1)
+    ax.axis("off")
+
+    def update(_frame):
+        levels = to_bars(next(stream))
+        heights = np.clip((levels - noise_floor) / AGC_SPAN_DB, 0, 1)
+        for rect, h in zip(bars, heights):
+            rect.set_height(h)
+        return bars.patches
+
+    ani = animation.FuncAnimation(fig, update, interval=1, blit=True,
+                                  cache_frame_data=False)
+    plt.show()
+    stream.close()
+
+
 if __name__ == "__main__":
     import sys
 
     args = sys.argv[1:]
     do_video = "-visualize_video" in args
     do_image = "-visualize_image" in args
-    for flag in ("-visualize_video", "-visualize_image"):
+    do_mic = "-visualize_mic" in args
+    for flag in ("-visualize_video", "-visualize_image", "-visualize_mic"):
         if flag in args:
             args.remove(flag)
     src = args[0] if args else "test.mp3"
 
-    if do_video:
+    if do_mic:
+        visualize_mic()
+    elif do_video:
         visualize_video(src)
     elif do_image:
         visualize_image(src)
