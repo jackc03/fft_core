@@ -219,6 +219,14 @@ def mic_to_spectrogram(n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP, device: int
                         dtype="float32", device=device, callback=callback):
         while True:
             block = q.get()
+            # drain any backlog and keep only the newest block -- if a
+            # consumer (e.g. rendering) ever falls behind the ~hop/fs cadence
+            # blocks pile up here, and processing them in strict FIFO order
+            # would mean an ever-growing lag between real time and what's
+            # displayed. Skipping stale blocks trades a few dropped hops for
+            # staying caught up to live audio.
+            while not q.empty():
+                block = q.get_nowait()
             buf = np.concatenate((buf[len(block):], block))
             # see mp3_to_numpy_spectrogram -- same n_fft/2 magnitude normalization
             spec = np.abs(fft_sim.numpy_fft(buf * window)[:n_fft // 2 + 1]) / (n_fft / 2)

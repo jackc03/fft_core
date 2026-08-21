@@ -70,8 +70,7 @@ def visualize_image(path: str):
     plt.show()
 
 
-def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP,
-                  calibrate_s: float = 1.0):
+def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP):
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
@@ -89,17 +88,6 @@ def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP
             out[i] = spec_db[lo:hi].max()
         return out
 
-    stream = mic_to_spectrogram(n_fft=n_fft, hop=hop)
-
-    # calibrate against THIS mic's actual idle noise, per bar, instead of
-    # guessing a universal dB reference -- Windows mic drivers often apply
-    # their own boost/AGC, so the real noise floor varies a lot by hardware
-    # and can't be predicted from a synthetic full-scale-tone calibration.
-    # Stay quiet for calibrate_s seconds when this starts.
-    n_calib = max(int(calibrate_s * TARGET_FS / hop), 1)
-    noise_floor = np.stack([to_bars(next(stream)) for _ in range(n_calib)]).max(axis=0)
-    AGC_SPAN_DB = 30.0  # dB above each bar's own noise floor mapped to full height
-
     theta = np.linspace(0, 2 * np.pi, n_bars, endpoint=False)
     r0 = 0.5  # inner radius -- bars spiral outward from this hole
 
@@ -110,9 +98,20 @@ def visualize_mic(n_bars: int = 48, n_fft: int = SPEC_N_FFT, hop: int = SPEC_HOP
     ax.set_ylim(0, r0 + 1)
     ax.axis("off")
 
+    stream = mic_to_spectrogram(n_fft=n_fft, hop=hop)
+    # adaptive ceiling: peak-hold the loudest thing seen recently, decaying
+    # back down by a fixed dB/frame when things go quiet -- self-calibrates
+    # to whatever this mic's actual range is instead of a guessed constant.
+    AGC_DECAY_DB = 0.03  # per frame -- slow drain, ~5.6 dB/s at hop=256 (48000/256 fps)
+    AGC_FLOOR_DB = -80.0  # ceiling never decays below this
+    AGC_SPAN_DB = 40.0    # dB range below the ceiling mapped to full bar height
+    agc = {"ceil": AGC_FLOOR_DB}
+
     def update(_frame):
         levels = to_bars(next(stream))
-        heights = np.clip((levels - noise_floor) / AGC_SPAN_DB, 0, 1)
+        agc["ceil"] = max(agc["ceil"] - AGC_DECAY_DB, levels.max(), AGC_FLOOR_DB)
+        floor = agc["ceil"] - AGC_SPAN_DB
+        heights = np.clip((levels - floor) / AGC_SPAN_DB, 0, 1)
         for rect, h in zip(bars, heights):
             rect.set_height(h)
         return bars.patches
